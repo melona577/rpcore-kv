@@ -4,6 +4,9 @@ name: KV Cache 생성
 # 트리거:
 #   1. 스토리 승인 시 → Worker가 자동 호출
 #   2. 수동 실행 (GitHub Actions 탭에서 직접)
+#
+# 동작:
+#   스토리 1개 → 1B 모델 / E2B 모델 동시 병렬 생성
 # ═══════════════════════════════════════════════════════════════
 
 on:
@@ -12,47 +15,38 @@ on:
       story_id:
         description: '스토리 ID'
         required: true
-      model_id:
-        description: '모델 ID'
-        required: true
-        default: 'gemma-3n-e2b'
-        type: choice
-        options:
-          - gemma-3n-e2b
-          - gemma-3-1b-qat
 
 env:
-  # ── 앱 llama_jni.cpp 와 반드시 동일 ──────────────────────────
-  CACHE_TYPE_K: q8_0       # cp.type_k = GGML_TYPE_Q8_0
-  CACHE_TYPE_V: q4_0       # cp.type_v = GGML_TYPE_Q4_0
-  N_CTX: 2048              # G.n_ctx = 2048
-  KV_VERSION: "2"          # KVCacheManager.ts LLAMA_RN_VERSION
+  CACHE_TYPE_K: q8_0
+  CACHE_TYPE_V: q4_0
+  KV_VERSION: "2"
 
 jobs:
   generate-kv:
+    name: "KV 생성 [${{ matrix.model_id }}]"
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # ── 두 모델 병렬 실행 ────────────────────────────────────
+    strategy:
+      fail-fast: false   # 한 모델 실패해도 다른 모델은 계속
+      matrix:
+        include:
+          - model_id: gemma-3-1b-qat
+            hf_repo: stduhpf/google-gemma-3-1b-it-qat-q4_0-gguf-small
+            hf_file: gemma-3-1b-it-q4_0_s.gguf
+            # DeviceProfiler PARAMS_1B.low.context = 4096 (앱 최솟값)
+            # KV 캐시는 생성 n_ctx <= 로드 n_ctx 여야 함 → 최솟값 고정
+            n_ctx: 4096
+
+          - model_id: gemma-3n-e2b
+            hf_repo: unsloth/gemma-3n-E2B-it-GGUF
+            hf_file: gemma-3n-E2B-it-IQ4_NL.gguf
+            # E2B ~1.5GB → sizeMB<=1500 → PARAMS_1B 표 적용 → 최솟값 4096
+            n_ctx: 4096
+
     steps:
-      # ── 0. 변수 준비 ────────────────────────────────────────
-      - name: 변수 설정
-        id: vars
-        run: |
-          echo "story_id=${{ github.event.inputs.story_id }}" >> $GITHUB_OUTPUT
-          echo "model_id=${{ github.event.inputs.model_id }}" >> $GITHUB_OUTPUT
-
-          # 모델별 HuggingFace 경로 설정
-          if [ "${{ github.event.inputs.model_id }}" = "gemma-3n-e2b" ]; then
-            echo "hf_repo=unsloth/gemma-3n-E2B-it-GGUF" >> $GITHUB_OUTPUT
-            echo "hf_file=gemma-3n-E2B-it-IQ4_NL.gguf" >> $GITHUB_OUTPUT
-          else
-            echo "hf_repo=stduhpf/google-gemma-3-1b-it-qat-q4_0-gguf-small" >> $GITHUB_OUTPUT
-            echo "hf_file=gemma-3-1b-it-q4_0_s.gguf" >> $GITHUB_OUTPUT
-          fi
-
-      # ── 1. llama.cpp 클론 (캐시) ────────────────────────────
-      # 캐시 키: llama.cpp 특정 커밋 해시 기준
-      # → 앱과 동일한 버전 유지 (secrets.LLAMA_CPP_HASH 에 저장)
+      # ── 1. llama.cpp 빌드 (캐시) ────────────────────────────
       - name: llama.cpp 캐시 확인
         id: cache-llama
         uses: actions/cache@v4
@@ -79,13 +73,12 @@ jobs:
         run: chmod +x llama_build/bin/llama-cli
 
       # ── 2. 모델 다운로드 (캐시) ─────────────────────────────
-      # 캐시 키: 모델 파일명 기준 (파일 바뀌면 자동 갱신)
       - name: 모델 캐시 확인
         id: cache-model
         uses: actions/cache@v4
         with:
-          path: models/${{ steps.vars.outputs.hf_file }}
-          key: model-${{ steps.vars.outputs.hf_file }}
+          path: models/${{ matrix.hf_file }}
+          key: model-${{ matrix.hf_file }}
 
       - name: 모델 다운로드
         if: steps.cache-model.outputs.cache-hit != 'true'
@@ -93,56 +86,56 @@ jobs:
           mkdir -p models
           pip install -q huggingface_hub
           huggingface-cli download \
-            ${{ steps.vars.outputs.hf_repo }} \
-            ${{ steps.vars.outputs.hf_file }} \
+            ${{ matrix.hf_repo }} \
+            ${{ matrix.hf_file }} \
             --local-dir models
-          echo "✅ 모델 다운로드 완료"
+          echo "✅ 모델 다운로드 완료: ${{ matrix.model_id }}"
 
       # ── 3. 챕터 목록 조회 ───────────────────────────────────
       - name: 챕터 목록 가져오기
         id: chapters
         run: |
-          STORY_ID="${{ steps.vars.outputs.story_id }}"
-          RESPONSE=$(curl -sf "${{ misty-mode-b5f5.bnm4564085.workers.dev }}/api/stories/$STORY_ID/kv-prompt")
+          STORY_ID="${{ github.event.inputs.story_id }}"
+          RESPONSE=$(curl -sf "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-prompt")
 
           if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
             echo "❌ 스토리 없음: $STORY_ID"
             exit 1
           fi
 
-          # 챕터 ID 목록을 JSON 배열로 추출
           CHAPTERS=$(echo "$RESPONSE" | jq -r '[.chapters[].chapterId] | @json')
-          echo "chapters=$CHAPTERS" >> $GITHUB_OUTPUT
           TOTAL=$(echo "$RESPONSE" | jq '.chapters | length')
+          echo "chapters=$CHAPTERS" >> $GITHUB_OUTPUT
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
-          echo "✅ 챕터 $TOTAL개 발견"
+          echo "✅ 챕터 ${TOTAL}개 발견 (모델: ${{ matrix.model_id }})"
 
       # ── 4. 챕터별 KV 생성 & 업로드 ─────────────────────────
       - name: KV 생성 및 업로드
         run: |
-          STORY_ID="${{ steps.vars.outputs.story_id }}"
-          MODEL_ID="${{ steps.vars.outputs.model_id }}"
-          MODEL_FILE="models/${{ steps.vars.outputs.hf_file }}"
+          STORY_ID="${{ github.event.inputs.story_id }}"
+          MODEL_ID="${{ matrix.model_id }}"
+          MODEL_FILE="models/${{ matrix.hf_file }}"
+          N_CTX="${{ matrix.n_ctx }}"
           CHAPTERS='${{ steps.chapters.outputs.chapters }}'
           LLAMA_CLI="llama_build/bin/llama-cli"
 
           echo "════════════════════════════════════"
-          echo "스토리: $STORY_ID | 모델: $MODEL_ID"
+          echo "스토리: $STORY_ID | 모델: $MODEL_ID | N_CTX: $N_CTX"
           echo "════════════════════════════════════"
 
           SUCCESS=0
           FAIL=0
 
-          # JSON 배열 순회
           for CH_ID in $(echo "$CHAPTERS" | jq -r '.[]'); do
             echo ""
             echo "── 챕터: $CH_ID ─────────────────────"
 
-            # 이미 KV 있는지 확인 (중복 생성 방지)
-            EXISTING=$(curl -sf "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv/$CH_ID" \
+            # 이미 이 모델용 KV가 있으면 스킵
+            EXISTING=$(curl -sf \
+              "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv/$CH_ID?modelId=$MODEL_ID" \
               | jq -r '.exists // false')
             if [ "$EXISTING" = "true" ]; then
-              echo "  ⏭  이미 존재 — 스킵"
+              echo "  ⏭  이미 존재 ($MODEL_ID) — 스킵"
               SUCCESS=$((SUCCESS + 1))
               continue
             fi
@@ -155,15 +148,14 @@ jobs:
             echo "  [1/4] 프롬프트 수신 (~${TOKEN_EST} 토큰)"
 
             # 2. KV prefill
-            # ⚠️ 이 파라미터가 앱 llama_jni.cpp 와 완전히 동일해야 함
-            OUT_BIN="/tmp/kv_${STORY_ID}_${CH_ID}.bin"
-            PROMPT_FILE="/tmp/prompt_${CH_ID}.txt"
+            OUT_BIN="/tmp/kv_${STORY_ID}_${CH_ID}_${MODEL_ID}.bin"
+            PROMPT_FILE="/tmp/prompt_${CH_ID}_${MODEL_ID}.txt"
             echo "$PROMPT" > "$PROMPT_FILE"
 
-            echo "  [2/4] llama-cli KV prefill..."
+            echo "  [2/4] llama-cli KV prefill (N_CTX=$N_CTX)..."
             "$LLAMA_CLI" \
               -m "$MODEL_FILE" \
-              --ctx-size ${{ env.N_CTX }} \
+              --ctx-size "$N_CTX" \
               --cache-type-k ${{ env.CACHE_TYPE_K }} \
               --cache-type-v ${{ env.CACHE_TYPE_V }} \
               --no-flash-attn \
@@ -213,7 +205,7 @@ jobs:
 
           echo ""
           echo "════════════════════════════════════"
-          echo "완료: 성공 ${SUCCESS}개 / 실패 ${FAIL}개"
+          echo "[$MODEL_ID] 완료: 성공 ${SUCCESS}개 / 실패 ${FAIL}개"
           echo "════════════════════════════════════"
 
           if [ "$FAIL" -gt 0 ]; then
