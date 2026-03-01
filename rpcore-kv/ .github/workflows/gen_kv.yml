@@ -103,7 +103,7 @@ jobs:
         id: chapters
         run: |
           STORY_ID="${{ steps.vars.outputs.story_id }}"
-          RESPONSE=$(curl -sf "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-prompt")
+          RESPONSE=$(curl -sf "${{ misty-mode-b5f5.bnm4564085.workers.dev }}/api/stories/$STORY_ID/kv-prompt")
 
           if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
             echo "❌ 스토리 없음: $STORY_ID"
