@@ -19,7 +19,9 @@ on:
 env:
   CACHE_TYPE_K: q8_0
   CACHE_TYPE_V: q4_0
-  KV_VERSION: "2"
+  KV_VERSION: "4"           # ✅ LlamaEngine v5 / KVCacheManager LLAMA_RN_VERSION = '4'
+  N_KEEP: 512               # ✅ DeviceProfiler.computeLlamaParams → nKeep = 512
+  ROPE_FREQ_BASE: 10000     # ✅ nCtx=4096 ≤ 8192 → ropeFreqBase = 10000
 
 jobs:
   generate-kv:
@@ -158,7 +160,9 @@ jobs:
               --ctx-size "$N_CTX" \
               --cache-type-k ${{ env.CACHE_TYPE_K }} \
               --cache-type-v ${{ env.CACHE_TYPE_V }} \
-              --no-flash-attn \
+              --flash-attn \
+              --keep ${{ env.N_KEEP }} \
+              --rope-freq-base ${{ env.ROPE_FREQ_BASE }} \
               --threads $(nproc) \
               --file "$PROMPT_FILE" \
               --prompt-cache "$OUT_BIN" \
