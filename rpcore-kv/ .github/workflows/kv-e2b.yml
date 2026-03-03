@@ -17,7 +17,7 @@ env:
   CACHE_TYPE_V: q4_0
   KV_VERSION: "4"
   N_KEEP: 512
-  ROPE_FREQ_BASE: 10000
+  ROPE_FREQ_BASE: 500000
 
 jobs:
   generate-kv-e2b:
