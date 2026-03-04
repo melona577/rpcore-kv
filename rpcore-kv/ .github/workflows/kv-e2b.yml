@@ -70,11 +70,10 @@ jobs:
         if: steps.cache-model.outputs.cache-hit != 'true'
         run: |
           mkdir -p models
-          pip install -q huggingface_hub
-          huggingface-cli download \
-            unsloth/gemma-3n-E2B-it-GGUF \
-            gemma-3n-E2B-it-Q4_K_M.gguf \
-            --local-dir models
+          curl -L \
+            -H "User-Agent: RPcore-App/3.0" \
+            "https://huggingface.co/unsloth/gemma-3n-E2B-it-GGUF/resolve/main/gemma-3n-E2B-it-Q4_K_M.gguf" \
+            -o "models/gemma-3n-E2B-it-Q4_K_M.gguf"
           echo "✅ E2B 모델 다운로드 완료"
 
       # ── 3. Base KV 다운로드 (고정룰 prefill 재사용) ─────────
@@ -183,7 +182,7 @@ jobs:
               --rope-freq-base ${{ env.ROPE_FREQ_BASE }} \
               --threads $(nproc) \
               --file "$PROMPT_FILE" \
-              --prompt-cache "$OUT_BIN" \
+              --prompt-cache-file "$OUT_BIN" \
               --prompt-cache-all \
               -n 0 \
               --log-disable 2>/dev/null
