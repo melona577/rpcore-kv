@@ -3,6 +3,11 @@ name: KV Cache 생성 [E2B 전담]
 # ═══════════════════════════════════════════════════════════════
 # 📍 본인 GitHub 계정 repo에 등록
 #    담당 모델: gemma-3n-e2b-reasoning (무거운 모델)
+#
+# [v6] base.bin 재사용
+#   kv-base-gen.yml 이 먼저 실행되어 R2에 base.bin이 있어야 함.
+#   base.bin = 고정룰 prefill KV (OUTPUT RULES + NARRATION RULES)
+#   → 챕터마다 고정룰 재prefill 스킵 → CI 속도 향상
 # ═══════════════════════════════════════════════════════════════
 
 on:
@@ -15,9 +20,10 @@ on:
 env:
   CACHE_TYPE_K: q8_0
   CACHE_TYPE_V: q4_0
-  KV_VERSION: "4"
+  KV_VERSION: "6"
   N_KEEP: 512
-  ROPE_FREQ_BASE: 10000
+  ROPE_FREQ_BASE: 500000
+  MODEL_ID: gemma-3n-e2b-reasoning
 
 jobs:
   generate-kv-e2b:
@@ -71,7 +77,32 @@ jobs:
             --local-dir models
           echo "✅ E2B 모델 다운로드 완료"
 
-      # ── 3. 챕터 목록 조회 ───────────────────────────────────
+      # ── 3. Base KV 다운로드 (고정룰 prefill 재사용) ─────────
+      - name: Base KV 다운로드
+        id: base_kv
+        run: |
+          BASE_INFO=$(curl -sf \
+            "${{ secrets.WORKER_URL }}/api/kv-base/${{ env.MODEL_ID }}")
+
+          EXISTS=$(echo "$BASE_INFO" | jq -r '.exists // false')
+
+          if [ "$EXISTS" = "true" ]; then
+            BASE_URL=$(echo "$BASE_INFO" | jq -r '.url')
+            curl -sf -o /tmp/base_${{ env.MODEL_ID }}.bin "$BASE_URL"
+            if [ -f "/tmp/base_${{ env.MODEL_ID }}.bin" ] && [ -s "/tmp/base_${{ env.MODEL_ID }}.bin" ]; then
+              BIN_KB=$(( $(wc -c < "/tmp/base_${{ env.MODEL_ID }}.bin") / 1024 ))
+              echo "✅ Base KV 다운로드 완료: ${BIN_KB} KB"
+              echo "has_base=true" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️  Base KV 다운로드 실패 — 폴백: 매 챕터 풀 prefill"
+              echo "has_base=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "⚠️  Base KV 없음 (kv-base-gen 먼저 실행 필요) — 폴백: 매 챕터 풀 prefill"
+            echo "has_base=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 4. 챕터 목록 조회 ───────────────────────────────────
       - name: 챕터 목록 가져오기
         id: chapters
         run: |
@@ -89,18 +120,21 @@ jobs:
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
           echo "✅ 챕터 ${TOTAL}개 발견 (E2B)"
 
-      # ── 4. 챕터별 KV 생성 & 업로드 ─────────────────────────
+      # ── 5. 챕터별 KV 생성 & 업로드 ─────────────────────────
       - name: KV 생성 및 업로드 [E2B]
         run: |
           STORY_ID="${{ github.event.inputs.story_id }}"
-          MODEL_ID="gemma-3n-e2b-reasoning"
+          MODEL_ID="${{ env.MODEL_ID }}"
           MODEL_FILE="models/gemma-3n-E2B-it-Q4_K_M.gguf"
           N_CTX="4096"
           CHAPTERS='${{ steps.chapters.outputs.chapters }}'
           LLAMA_CLI="llama_build/bin/llama-cli"
+          HAS_BASE="${{ steps.base_kv.outputs.has_base }}"
+          BASE_BIN="/tmp/base_${MODEL_ID}.bin"
 
           echo "════════════════════════════════════"
           echo "스토리: $STORY_ID | 모델: $MODEL_ID"
+          echo "Base KV 재사용: $HAS_BASE"
           echo "════════════════════════════════════"
 
           SUCCESS=0
@@ -120,19 +154,26 @@ jobs:
               continue
             fi
 
-            # 프롬프트 가져오기
+            # 프롬프트 가져오기 (고정룰 + 스토리 델타 전체)
             PROMPT_JSON=$(curl -sf \
               "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-prompt?chapterId=$CH_ID")
             PROMPT=$(echo "$PROMPT_JSON" | jq -r '.prompt')
             TOKEN_EST=$(echo "$PROMPT_JSON" | jq -r '.tokenEstimate // 0')
             echo "  [1/4] 프롬프트 수신 (~${TOKEN_EST} 토큰)"
 
-            # KV prefill
             OUT_BIN="/tmp/kv_${STORY_ID}_${CH_ID}_e2b.bin"
             PROMPT_FILE="/tmp/prompt_${CH_ID}_e2b.txt"
             echo "$PROMPT" > "$PROMPT_FILE"
 
-            echo "  [2/4] llama-cli KV prefill..."
+            # Base KV가 있으면 복사 → llama-cli가 LCP match로 고정룰 부분 스킵
+            # Base KV가 없으면 빈 상태에서 풀 prefill (폴백)
+            if [ "$HAS_BASE" = "true" ] && [ -f "$BASE_BIN" ]; then
+              cp "$BASE_BIN" "$OUT_BIN"
+              echo "  [2/4] llama-cli KV prefill (Base KV 재사용 — 스토리 델타만)..."
+            else
+              echo "  [2/4] llama-cli KV prefill (풀 prefill)..."
+            fi
+
             "$LLAMA_CLI" \
               -m "$MODEL_FILE" \
               --ctx-size "$N_CTX" \
