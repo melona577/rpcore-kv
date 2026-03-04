@@ -167,6 +167,7 @@ jobs:
               --ctx-size "$N_CTX" \
               --batch-size 2048 \
               --ubatch-size 2048 \
+              --flash-attn \
               --cache-type-k ${{ env.CACHE_TYPE_K }} \
               --cache-type-v ${{ env.CACHE_TYPE_V }} \
               --keep ${{ env.N_KEEP }} \
