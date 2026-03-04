@@ -15,7 +15,7 @@ on:
 env:
   CACHE_TYPE_K: q8_0
   CACHE_TYPE_V: q4_0
-  KV_VERSION: "6"
+  KV_VERSION: "7"
   N_KEEP: 512
   ROPE_FREQ_BASE: 500000
   MODEL_ID: gemma-3n-e2b-reasoning
