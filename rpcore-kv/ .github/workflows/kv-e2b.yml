@@ -118,7 +118,7 @@ jobs:
           STORY_ID="${{ github.event.inputs.story_id }}"
           MODEL_ID="${{ env.MODEL_ID }}"
           MODEL_FILE="models/gemma-3n-E2B-it-Q4_K_M.gguf"
-          N_CTX="4096"
+          N_CTX="8192"
           CHAPTERS='${{ steps.chapters.outputs.chapters }}'
           LLAMA_CLI="llama_build/bin/llama-cli"
           HAS_BASE="${{ steps.base_kv.outputs.has_base }}"
