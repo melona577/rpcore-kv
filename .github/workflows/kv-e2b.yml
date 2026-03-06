@@ -41,9 +41,9 @@ jobs:
             -DLLAMA_BUILD_SERVER=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DGGML_NATIVE=ON
-          cmake --build build --target llama-cli -j$(nproc)
+          cmake --build build --target main -j$(nproc)
           mkdir -p ../llama_build/bin
-          cp build/bin/llama-cli ../llama_build/bin/
+          cp build/bin/main ../llama_build/bin/llama-cli
           echo "✅ llama-cli 빌드 완료"
 
       - name: llama-cli 권한 설정
