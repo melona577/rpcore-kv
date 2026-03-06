@@ -427,3 +427,10 @@ jobs:
           echo "[E2B] 완료: 성공 ${SUCCESS}개 / 실패 ${FAIL}개"
           echo "════════════════════════════════════"
           if [ "$FAIL" -gt 0 ]; then exit 1; fi
+
+          # ── KV 완료 신고 ──────────────────────────────────────
+          curl -sf -X POST \
+            "${{ secrets.WORKER_URL }}/internal/stories/$STORY_ID/kv-done" \
+            -H "X-Internal-Secret: ${{ secrets.INTERNAL_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{}' || echo "⚠️  kv-done 신고 실패 (무시)"
