@@ -23,37 +23,129 @@ jobs:
     timeout-minutes: 35
 
     steps:
-      # ── 1. llama.cpp 빌드 ────────────────────────────────────
-      - name: llama.cpp 캐시 확인
-        id: cache-llama
+      # ── 1. kv-prefill 빌드 (베이스 워크플로우와 동일) ────────
+      - name: kv-prefill 캐시 확인
+        id: cache-prefill
         uses: actions/cache@v4
         with:
-          path: llama_build/bin/llama-cli
-          key: llama-cli-${{ secrets.LLAMA_CPP_HASH }}-ubuntu-native
+          path: llama_build/bin/kv-prefill
+          key: kv-prefill-${{ secrets.LLAMA_CPP_HASH }}-ubuntu-static
 
-      - name: llama.cpp 빌드
-        if: steps.cache-llama.outputs.cache-hit != 'true'
+      - name: llama.cpp 클론 및 kv-prefill 빌드
+        if: steps.cache-prefill.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/ggml-org/llama.cpp llama_src
           cd llama_src
           git checkout ${{ secrets.LLAMA_CPP_HASH }}
-          cmake -B build \
-            -DLLAMA_BUILD_SERVER=OFF \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_EXAMPLES=ON \
-            -DGGML_NATIVE=ON
-          # 전체 빌드 후 바이너리 탐색 (버전마다 이름 다름: main / llama-cli / llama-run)
-          cmake --build build -j$(nproc)
-          mkdir -p ../llama_build/bin
-          BIN=$(find build/bin -maxdepth 1 -type f \( -name "llama-cli" -o -name "main" -o -name "llama-run" \) | head -1)
-          if [ -z "$BIN" ]; then
-            echo "❌ 실행 바이너리를 찾을 수 없음"; find build/bin -type f; exit 1
-          fi
-          cp "$BIN" ../llama_build/bin/llama-cli
-          echo "✅ 빌드 완료: $BIN → llama_build/bin/llama-cli"
+          git log --oneline -1
 
-      - name: llama-cli 권한 설정
-        run: chmod +x llama_build/bin/llama-cli
+          mkdir -p examples/kv-prefill
+          cat << 'EOF' > examples/kv-prefill/kv-prefill.cpp
+          #include "llama.h"
+          #include <cstdio>
+          #include <cstring>
+          #include <fstream>
+          #include <sstream>
+          #include <string>
+          #include <vector>
+
+          int main(int argc, char** argv) {
+            if (argc < 5) {
+              fprintf(stderr,
+                "Usage: kv-prefill <model> <prompt_file> <output_bin>"
+                " <n_ctx> [rope_freq_base] [cache_type_k] [cache_type_v] [n_keep]\n");
+              return 1;
+            }
+            const char* model_path     = argv[1];
+            const char* prompt_file    = argv[2];
+            const char* output_bin     = argv[3];
+            int         n_ctx          = atoi(argv[4]);
+            float       rope_freq_base = argc > 5 ? atof(argv[5]) : 10000.0f;
+            const char* ck             = argc > 6 ? argv[6] : "q8_0";
+            const char* cv             = argc > 7 ? argv[7] : "q4_0";
+            int         n_keep         = argc > 8 ? atoi(argv[8]) : 512;
+
+            std::ifstream pf(prompt_file);
+            if (!pf.is_open()) { fprintf(stderr, "❌ 프롬프트 파일 열기 실패: %s\n", prompt_file); return 1; }
+            std::ostringstream ss; ss << pf.rdbuf();
+            std::string prompt = ss.str();
+            fprintf(stderr, "✅ 프롬프트: %zu chars\n", prompt.size());
+
+            llama_backend_init();
+            llama_model_params mparams = llama_model_default_params();
+            mparams.use_mmap = true;
+            llama_model* model = llama_model_load_from_file(model_path, mparams);
+            if (!model) { fprintf(stderr, "❌ 모델 로드 실패: %s\n", model_path); llama_backend_free(); return 1; }
+
+            llama_context_params cparams = llama_context_default_params();
+            cparams.n_ctx          = n_ctx;
+            cparams.n_batch        = 2048;
+            cparams.n_ubatch       = 2048;
+            cparams.rope_freq_base = rope_freq_base;
+            cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+
+            auto parse_type = [](const char* s) -> ggml_type {
+              if (strcmp(s, "q8_0") == 0) return GGML_TYPE_Q8_0;
+              if (strcmp(s, "q4_0") == 0) return GGML_TYPE_Q4_0;
+              if (strcmp(s, "f16")  == 0) return GGML_TYPE_F16;
+              return GGML_TYPE_F16;
+            };
+            cparams.type_k = parse_type(ck);
+            cparams.type_v = parse_type(cv);
+
+            llama_context* ctx = llama_init_from_model(model, cparams);
+            if (!ctx) { fprintf(stderr, "❌ 컨텍스트 초기화 실패\n"); llama_model_free(model); llama_backend_free(); return 1; }
+            fprintf(stderr, "✅ 컨텍스트 초기화 완료 (n_ctx=%d)\n", n_ctx);
+
+            const llama_vocab* vocab = llama_model_get_vocab(model);
+            std::vector<llama_token> tokens(n_ctx);
+            int n_tokens = llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(),
+                                          tokens.data(), (int)tokens.size(), true, true);
+            if (n_tokens < 0) { fprintf(stderr, "❌ 토크나이즈 실패\n"); llama_free(ctx); llama_model_free(model); llama_backend_free(); return 1; }
+            tokens.resize(n_tokens);
+            fprintf(stderr, "✅ 토큰 수: %d\n", n_tokens);
+
+            llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
+            if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "❌ prefill 실패\n"); llama_free(ctx); llama_model_free(model); llama_backend_free(); return 1; }
+            fprintf(stderr, "✅ prefill 완료\n");
+
+            if (!llama_state_save_file(ctx, output_bin, tokens.data(), n_tokens)) {
+              fprintf(stderr, "❌ KV 저장 실패: %s\n", output_bin);
+              llama_free(ctx); llama_model_free(model); llama_backend_free(); return 1;
+            }
+            fprintf(stderr, "✅ KV 저장 완료: %s\n", output_bin);
+
+            llama_free(ctx); llama_model_free(model); llama_backend_free();
+            return 0;
+          }
+          EOF
+
+          cat << 'EOF' > examples/kv-prefill/CMakeLists.txt
+          add_executable(kv-prefill kv-prefill.cpp)
+          target_link_libraries(kv-prefill PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+          target_include_directories(kv-prefill PRIVATE
+            ${CMAKE_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/ggml/include
+            ${CMAKE_SOURCE_DIR}/src
+          )
+          install(TARGETS kv-prefill RUNTIME)
+          EOF
+
+          echo 'add_subdirectory(examples/kv-prefill)' >> CMakeLists.txt
+
+          cmake -B build \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DGGML_NATIVE=OFF \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build build -j$(nproc) --target kv-prefill
+
+          mkdir -p ../llama_build/bin
+          cp build/bin/kv-prefill ../llama_build/bin/
+          echo "✅ kv-prefill 빌드 완료"
+
+      - name: kv-prefill 권한 설정
+        run: chmod +x llama_build/bin/kv-prefill
 
       # ── 2. 모델 다운로드 ─────────────────────────────────────
       - name: 모델 캐시 확인
@@ -73,48 +165,22 @@ jobs:
             -o "models/google_gemma-3n-E2B-it-Q4_K_M.gguf"
           echo "✅ E2B 모델 다운로드 완료"
 
-      # ── 3. Base KV 다운로드 ──────────────────────────────────
-      - name: Base KV 다운로드
-        id: base_kv
-        run: |
-          BASE_INFO=$(curl -sf "${{ secrets.WORKER_URL }}/api/kv-base/${{ env.MODEL_ID }}")
-          EXISTS=$(echo "$BASE_INFO" | jq -r '.exists // false')
-
-          if [ "$EXISTS" = "true" ]; then
-            BASE_URL=$(echo "$BASE_INFO" | jq -r '.url')
-            curl -sf -o "/tmp/base_${{ env.MODEL_ID }}.bin" "$BASE_URL"
-            if [ -f "/tmp/base_${{ env.MODEL_ID }}.bin" ] && [ -s "/tmp/base_${{ env.MODEL_ID }}.bin" ]; then
-              BIN_KB=$(( $(wc -c < "/tmp/base_${{ env.MODEL_ID }}.bin") / 1024 ))
-              echo "✅ Base KV 다운로드 완료: ${BIN_KB} KB"
-              echo "has_base=true" >> $GITHUB_OUTPUT
-            else
-              echo "⚠️  Base KV 다운로드 실패 — 폴백: 풀 prefill"
-              echo "has_base=false" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "⚠️  Base KV 없음 — 폴백: 풀 prefill"
-            echo "has_base=false" >> $GITHUB_OUTPUT
-          fi
-
-      # ── 4. 챕터 목록 조회 ────────────────────────────────────
+      # ── 3. 챕터 목록 조회 ────────────────────────────────────
       - name: 챕터 목록 가져오기
         id: chapters
         run: |
           STORY_ID="${{ github.event.inputs.story_id }}"
           RESPONSE=$(curl -sf "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-prompt")
-
           if [ $? -ne 0 ] || [ -z "$RESPONSE" ]; then
-            echo "❌ 스토리 없음: $STORY_ID"
-            exit 1
+            echo "❌ 스토리 없음: $STORY_ID"; exit 1
           fi
-
           CHAPTERS=$(echo "$RESPONSE" | jq -r '[.chapters[].chapterId] | @json')
           TOTAL=$(echo "$RESPONSE" | jq '.chapters | length')
           echo "chapters=$CHAPTERS" >> $GITHUB_OUTPUT
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
           echo "✅ 챕터 ${TOTAL}개 발견 (E2B)"
 
-      # ── 5. 코어 목록 조회 ────────────────────────────────────
+      # ── 4. 코어 목록 조회 ────────────────────────────────────
       - name: 코어 목록 가져오기
         id: cores
         run: |
@@ -132,20 +198,17 @@ jobs:
             echo "✅ 코어 ${TOTAL}개 발견"
           fi
 
-      # ── 6. 챕터별 KV 생성 & 업로드 ──────────────────────────
+      # ── 5. 챕터별 KV 생성 & 업로드 ──────────────────────────
       - name: 챕터 KV 생성 및 업로드 [E2B]
         run: |
           STORY_ID="${{ github.event.inputs.story_id }}"
           MODEL_ID="${{ env.MODEL_ID }}"
           MODEL_FILE="models/google_gemma-3n-E2B-it-Q4_K_M.gguf"
           CHAPTERS='${{ steps.chapters.outputs.chapters }}'
-          LLAMA_CLI="llama_build/bin/llama-cli"
-          HAS_BASE="${{ steps.base_kv.outputs.has_base }}"
-          BASE_BIN="/tmp/base_${MODEL_ID}.bin"
+          KV_PREFILL="llama_build/bin/kv-prefill"
 
           echo "════════════════════════════════════"
           echo "스토리: $STORY_ID | 모델: $MODEL_ID"
-          echo "Base KV 재사용: $HAS_BASE"
           echo "════════════════════════════════════"
 
           SUCCESS=0
@@ -174,29 +237,16 @@ jobs:
             PROMPT_FILE="/tmp/prompt_${CH_ID}_e2b.txt"
             echo "$PROMPT" > "$PROMPT_FILE"
 
-            if [ "$HAS_BASE" = "true" ] && [ -f "$BASE_BIN" ]; then
-              cp "$BASE_BIN" "$OUT_BIN"
-              echo "  [2/4] llama-cli KV prefill (Base KV 재사용)..."
-            else
-              echo "  [2/4] llama-cli KV prefill (풀 prefill)..."
-            fi
-
-            "$LLAMA_CLI" \
-              -m "$MODEL_FILE" \
-              --ctx-size ${{ env.N_CTX }} \
-              --batch-size 2048 \
-              --ubatch-size 2048 \
-              --flash-attn \
-              --cache-type-k ${{ env.CACHE_TYPE_K }} \
-              --cache-type-v ${{ env.CACHE_TYPE_V }} \
-              --keep ${{ env.N_KEEP }} \
-              --rope-freq-base ${{ env.ROPE_FREQ_BASE }} \
-              --threads $(nproc) \
-              --file "$PROMPT_FILE" \
-              --prompt-cache-file "$OUT_BIN" \
-              --prompt-cache-all \
-              -n 0 \
-              --log-disable 2>/dev/null
+            echo "  [2/4] kv-prefill 실행..."
+            "$KV_PREFILL" \
+              "$MODEL_FILE" \
+              "$PROMPT_FILE" \
+              "$OUT_BIN" \
+              "${{ env.N_CTX }}" \
+              "${{ env.ROPE_FREQ_BASE }}" \
+              "${{ env.CACHE_TYPE_K }}" \
+              "${{ env.CACHE_TYPE_V }}" \
+              "${{ env.N_KEEP }}"
 
             if [ ! -f "$OUT_BIN" ] || [ ! -s "$OUT_BIN" ]; then
               echo "  ❌ KV 생성 실패"
