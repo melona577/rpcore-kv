@@ -323,26 +323,28 @@ jobs:
           except urllib.error.HTTPError as e:
               print(f"  ❌ R2 업로드 실패: HTTP {e.code} | {e.read().decode()[:200]}", file=sys.stderr); sys.exit(1)
 
-          sql = (
-              "INSERT INTO story_kv_cache (story_id, chapter_id, model_id, llama_rn_version, r2_key) "
-              "VALUES (?, ?, ?, ?, ?) "
-              "ON CONFLICT(story_id, chapter_id, model_id) DO UPDATE SET "
-              "r2_key=excluded.r2_key, llama_rn_version=excluded.llama_rn_version, created_at=datetime('now')"
-          )
-          payload = json.dumps({"sql": sql, "params": [story_id, ch_id, model_id, kv_version, r2_key]}).encode()
-          d1_req = urllib.request.Request(
-              f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{d1_db_id}/query",
-              data=payload,
-              headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
-              method="POST",
-          )
+          def d1_query(sql, params):
+              payload = json.dumps({"sql": sql, "params": params}).encode()
+              req = urllib.request.Request(
+                  f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{d1_db_id}/query",
+                  data=payload,
+                  headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(req) as res:
+                  return json.loads(res.read())
+
           try:
-              with urllib.request.urlopen(d1_req) as res:
-                  body = json.loads(res.read())
-                  if body.get("success"):
-                      print(f"  ✅ 업로드 완료: {r2_key}")
-                  else:
-                      print(f"  ❌ D1 등록 실패: {body}", file=sys.stderr); sys.exit(1)
+              d1_query("DELETE FROM story_kv_cache WHERE story_id=? AND chapter_id=? AND model_id=?",
+                       [story_id, ch_id, model_id])
+              body = d1_query(
+                  "INSERT INTO story_kv_cache (story_id, chapter_id, model_id, llama_rn_version, r2_key) VALUES (?, ?, ?, ?, ?)",
+                  [story_id, ch_id, model_id, kv_version, r2_key]
+              )
+              if body.get("success"):
+                  print(f"  ✅ 업로드 완료: {r2_key}")
+              else:
+                  print(f"  ❌ D1 등록 실패: {body}", file=sys.stderr); sys.exit(1)
           except urllib.error.HTTPError as e:
               print(f"  ❌ D1 API 실패: HTTP {e.code} | {e.read().decode()[:200]}", file=sys.stderr); sys.exit(1)
           PYEOF
