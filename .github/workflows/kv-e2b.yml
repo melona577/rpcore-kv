@@ -23,6 +23,14 @@ jobs:
     timeout-minutes: 35
 
     steps:
+      - name: 트리거 권한 확인
+        run: |
+          if [ "${{ github.actor }}" != "melona577" ]; then
+            echo "❌ 권한 없음: ${{ github.actor }}"
+            exit 1
+          fi
+          echo "✅ 인증됨: ${{ github.actor }}"
+
       # ── 1. kv-prefill 빌드 (베이스 워크플로우와 동일) ────────
       - name: kv-prefill 캐시 확인
         id: cache-prefill
@@ -49,40 +57,24 @@ jobs:
           #include <string>
           #include <vector>
 
+          // 사용법: kv-prefill <model> <n_ctx> <rope_freq_base> <cache_k> <cache_v> <n_keep> <prompt1:out1> [<prompt2:out2> ...]
+          // 모델을 한 번만 로드하고 챕터를 순차 처리
           int main(int argc, char** argv) {
-            if (argc < 5) {
+            if (argc < 8) {
               fprintf(stderr,
-                "Usage: kv-prefill <model> <prompt_file> <output_bin>"
-                " <n_ctx> [rope_freq_base] [cache_type_k] [cache_type_v] [n_keep]\n");
+                "Usage: kv-prefill <model> <n_ctx> <rope_freq_base>"
+                " <cache_type_k> <cache_type_v> <n_keep>"
+                " <prompt_file:output_bin> [...]
+");
               return 1;
             }
             const char* model_path     = argv[1];
-            const char* prompt_file    = argv[2];
-            const char* output_bin     = argv[3];
-            int         n_ctx          = atoi(argv[4]);
-            float       rope_freq_base = argc > 5 ? atof(argv[5]) : 10000.0f;
-            const char* ck             = argc > 6 ? argv[6] : "q8_0";
-            const char* cv             = argc > 7 ? argv[7] : "q4_0";
-            int         n_keep         = argc > 8 ? atoi(argv[8]) : 512;
-
-            std::ifstream pf(prompt_file);
-            if (!pf.is_open()) { fprintf(stderr, "❌ 프롬프트 파일 열기 실패: %s\n", prompt_file); return 1; }
-            std::ostringstream ss; ss << pf.rdbuf();
-            std::string prompt = ss.str();
-            fprintf(stderr, "✅ 프롬프트: %zu chars\n", prompt.size());
-
-            llama_backend_init();
-            llama_model_params mparams = llama_model_default_params();
-            mparams.use_mmap = true;
-            llama_model* model = llama_model_load_from_file(model_path, mparams);
-            if (!model) { fprintf(stderr, "❌ 모델 로드 실패: %s\n", model_path); llama_backend_free(); return 1; }
-
-            llama_context_params cparams = llama_context_default_params();
-            cparams.n_ctx          = n_ctx;
-            cparams.n_batch        = n_ctx;
-            cparams.n_ubatch       = n_ctx;
-            cparams.rope_freq_base = rope_freq_base;
-            cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            int         n_ctx          = atoi(argv[2]);
+            float       rope_freq_base = atof(argv[3]);
+            const char* ck             = argv[4];
+            const char* cv             = argv[5];
+            int         n_keep         = atoi(argv[6]);
+            // argv[7..] 가 "prompt:output" 쌍
 
             auto parse_type = [](const char* s) -> ggml_type {
               if (strcmp(s, "q8_0") == 0) return GGML_TYPE_Q8_0;
@@ -90,33 +82,92 @@ jobs:
               if (strcmp(s, "f16")  == 0) return GGML_TYPE_F16;
               return GGML_TYPE_F16;
             };
-            cparams.type_k = parse_type(ck);
-            cparams.type_v = parse_type(cv);
 
-            llama_context* ctx = llama_init_from_model(model, cparams);
-            if (!ctx) { fprintf(stderr, "❌ 컨텍스트 초기화 실패\n"); llama_model_free(model); llama_backend_free(); return 1; }
-            fprintf(stderr, "✅ 컨텍스트 초기화 완료 (n_ctx=%d)\n", n_ctx);
+            llama_backend_init();
+
+            llama_model_params mparams = llama_model_default_params();
+            mparams.use_mmap = true;
+            llama_model* model = llama_model_load_from_file(model_path, mparams);
+            if (!model) { fprintf(stderr, "❌ 모델 로드 실패: %s
+", model_path); llama_backend_free(); return 1; }
+            fprintf(stderr, "✅ 모델 로드 완료
+");
+
+            llama_context_params cparams = llama_context_default_params();
+            cparams.n_ctx           = n_ctx;
+            cparams.n_batch         = n_ctx;
+            cparams.n_ubatch        = n_ctx;
+            cparams.rope_freq_base  = rope_freq_base;
+            cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            cparams.type_k          = parse_type(ck);
+            cparams.type_v          = parse_type(cv);
 
             const llama_vocab* vocab = llama_model_get_vocab(model);
-            std::vector<llama_token> tokens(n_ctx);
-            int n_tokens = llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(),
-                                          tokens.data(), (int)tokens.size(), true, true);
-            if (n_tokens < 0) { fprintf(stderr, "❌ 토크나이즈 실패\n"); llama_free(ctx); llama_model_free(model); llama_backend_free(); return 1; }
-            tokens.resize(n_tokens);
-            fprintf(stderr, "✅ 토큰 수: %d\n", n_tokens);
+            int total = argc - 7;
+            int ok = 0, fail = 0;
 
-            llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
-            if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "❌ prefill 실패\n"); llama_free(ctx); llama_model_free(model); llama_backend_free(); return 1; }
-            fprintf(stderr, "✅ prefill 완료\n");
+            for (int i = 7; i < argc; i++) {
+              std::string arg(argv[i]);
+              auto sep = arg.rfind(':');
+              if (sep == std::string::npos) {
+                fprintf(stderr, "❌ 잘못된 인자 (prompt:output 형식 필요): %s
+", argv[i]);
+                fail++; continue;
+              }
+              std::string prompt_file = arg.substr(0, sep);
+              std::string output_bin  = arg.substr(sep + 1);
 
-            if (!llama_state_save_file(ctx, output_bin, tokens.data(), n_tokens)) {
-              fprintf(stderr, "❌ KV 저장 실패: %s\n", output_bin);
-              llama_free(ctx); llama_model_free(model); llama_backend_free(); return 1;
+              fprintf(stderr, "
+[%d/%d] %s
+", i-6, total, prompt_file.c_str());
+
+              std::ifstream pf(prompt_file);
+              if (!pf.is_open()) { fprintf(stderr, "❌ 프롬프트 파일 열기 실패
+"); fail++; continue; }
+              std::ostringstream ss; ss << pf.rdbuf();
+              std::string prompt = ss.str();
+
+              // 컨텍스트 새로 생성 (챕터마다 KV 초기화)
+              llama_context* ctx = llama_init_from_model(model, cparams);
+              if (!ctx) { fprintf(stderr, "❌ 컨텍스트 초기화 실패
+"); fail++; continue; }
+
+              std::vector<llama_token> tokens(n_ctx);
+              int n_tokens = llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(),
+                                            tokens.data(), (int)tokens.size(), true, true);
+              if (n_tokens < 0) {
+                fprintf(stderr, "❌ 토크나이즈 실패
+");
+                llama_free(ctx); fail++; continue;
+              }
+              tokens.resize(n_tokens);
+              fprintf(stderr, "  토큰: %d
+", n_tokens);
+
+              llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
+              if (llama_decode(ctx, batch) != 0) {
+                fprintf(stderr, "❌ prefill 실패
+");
+                llama_free(ctx); fail++; continue;
+              }
+
+              if (!llama_state_save_file(ctx, output_bin.c_str(), tokens.data(), n_tokens)) {
+                fprintf(stderr, "❌ KV 저장 실패: %s
+", output_bin.c_str());
+                llama_free(ctx); fail++; continue;
+              }
+              fprintf(stderr, "  ✅ 저장 완료: %s
+", output_bin.c_str());
+              llama_free(ctx);
+              ok++;
             }
-            fprintf(stderr, "✅ KV 저장 완료: %s\n", output_bin);
 
-            llama_free(ctx); llama_model_free(model); llama_backend_free();
-            return 0;
+            llama_model_free(model);
+            llama_backend_free();
+            fprintf(stderr, "
+완료: 성공 %d / 실패 %d
+", ok, fail);
+            return fail > 0 ? 1 : 0;
           }
           EOF
 
@@ -211,19 +262,16 @@ jobs:
           echo "스토리: $STORY_ID | 모델: $MODEL_ID"
           echo "════════════════════════════════════"
 
-          SUCCESS=0
-          FAIL=0
+          # ── Phase 1: 프롬프트 수신 & 처리 대상 목록 구성 ──────
+          PREFILL_ARGS=""
+          PENDING_CHAPTERS=""
 
           for CH_ID in $(echo "$CHAPTERS" | jq -r '.[]'); do
-            echo ""
-            echo "── 챕터: $CH_ID ─────────────────────"
-
             EXISTING=$(curl -sf \
               "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv/$CH_ID?modelId=$MODEL_ID" \
               | jq -r '.exists // false')
             if [ "$EXISTING" = "true" ]; then
-              echo "  ⏭  이미 존재 — 스킵"
-              SUCCESS=$((SUCCESS + 1))
+              echo "⏭  $CH_ID — 이미 존재, 스킵"
               continue
             fi
 
@@ -231,35 +279,53 @@ jobs:
               "${{ secrets.WORKER_URL }}/api/stories/$STORY_ID/kv-prompt?chapterId=$CH_ID")
             PROMPT=$(echo "$PROMPT_JSON" | jq -r '.prompt')
             TOKEN_EST=$(echo "$PROMPT_JSON" | jq -r '.tokenEstimate // 0')
-            echo "  [1/4] 프롬프트 수신 (~${TOKEN_EST} 토큰)"
+            PROMPT_FILE="/tmp/prompt_${CH_ID}_e2b.txt"
+            OUT_BIN="/tmp/kv_${STORY_ID}_${CH_ID}_e2b.bin"
+            echo "$PROMPT" > "$PROMPT_FILE"
+            echo "  📥 $CH_ID (~${TOKEN_EST} 토큰)"
 
+            PREFILL_ARGS="$PREFILL_ARGS ${PROMPT_FILE}:${OUT_BIN}"
+            PENDING_CHAPTERS="$PENDING_CHAPTERS $CH_ID"
+          done
+
+          if [ -z "$PENDING_CHAPTERS" ]; then
+            echo "✅ 모든 챕터 이미 존재 — 완료"
+            exit 0
+          fi
+
+          # ── Phase 2: 모델 1회 로드 → 전체 챕터 일괄 prefill ──
+          echo ""
+          echo "🚀 kv-prefill 실행 (모델 1회 로드, 챕터 일괄 처리)..."
+          "$KV_PREFILL" \
+            "$MODEL_FILE" \
+            "${{ env.N_CTX }}" \
+            "${{ env.ROPE_FREQ_BASE }}" \
+            "${{ env.CACHE_TYPE_K }}" \
+            "${{ env.CACHE_TYPE_V }}" \
+            "${{ env.N_KEEP }}" \
+            $PREFILL_ARGS
+
+          PREFILL_EXIT=$?
+
+          # ── Phase 3: 생성된 bin 업로드 ────────────────────────
+          SUCCESS=0
+          FAIL=0
+
+          for CH_ID in $PENDING_CHAPTERS; do
             OUT_BIN="/tmp/kv_${STORY_ID}_${CH_ID}_e2b.bin"
             PROMPT_FILE="/tmp/prompt_${CH_ID}_e2b.txt"
-            echo "$PROMPT" > "$PROMPT_FILE"
-
-            echo "  [2/4] kv-prefill 실행..."
-            "$KV_PREFILL" \
-              "$MODEL_FILE" \
-              "$PROMPT_FILE" \
-              "$OUT_BIN" \
-              "${{ env.N_CTX }}" \
-              "${{ env.ROPE_FREQ_BASE }}" \
-              "${{ env.CACHE_TYPE_K }}" \
-              "${{ env.CACHE_TYPE_V }}" \
-              "${{ env.N_KEEP }}"
 
             if [ ! -f "$OUT_BIN" ] || [ ! -s "$OUT_BIN" ]; then
-              echo "  ❌ KV 생성 실패"
+              echo "❌ $CH_ID — KV bin 없음 (prefill 실패)"
               FAIL=$((FAIL + 1))
               continue
             fi
 
             BIN_KB=$(( $(wc -c < "$OUT_BIN") / 1024 ))
-            echo "  [3/4] bin 생성: ${BIN_KB} KB"
-            echo "  [4/4] 업로드..."
+            echo "📤 $CH_ID — ${BIN_KB} KB 업로드 중..."
 
             python3 << PYEOF
-          import os, sys, json, hashlib, hmac, datetime, uuid
+          import sys, json, hashlib, hmac, datetime
           import urllib.request, urllib.error
           from urllib.parse import urlencode
 
@@ -308,8 +374,11 @@ jobs:
               ("X-Amz-SignedHeaders", "host"),
           ])
           qs = urlencode(params)
-          canonical = "\n".join(["PUT", f"/{r2_key}", qs, f"host:{host}\n", "host", "UNSIGNED-PAYLOAD"])
-          string_to_sign = "\n".join(["AWS4-HMAC-SHA256", timestamp, credential_scope, sha256hex(canonical)])
+          canonical = "
+".join(["PUT", f"/{r2_key}", qs, f"host:{host}
+", "host", "UNSIGNED-PAYLOAD"])
+          string_to_sign = "
+".join(["AWS4-HMAC-SHA256", timestamp, credential_scope, sha256hex(canonical)])
           signing_key = get_signing_key(r2_secret_key, datestamp, region, service)
           signature = hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
           presigned_url = f"https://{host}/{r2_key}?{qs}&X-Amz-Signature={signature}"
@@ -319,9 +388,9 @@ jobs:
           try:
               with urllib.request.urlopen(req) as res:
                   if res.status not in (200, 204):
-                      print(f"  ❌ R2 업로드 실패: {res.status}", file=sys.stderr); sys.exit(1)
+                      print(f"❌ R2 실패: {res.status}", file=sys.stderr); sys.exit(1)
           except urllib.error.HTTPError as e:
-              print(f"  ❌ R2 업로드 실패: HTTP {e.code} | {e.read().decode()[:200]}", file=sys.stderr); sys.exit(1)
+              print(f"❌ R2 실패: HTTP {e.code} | {e.read().decode()[:200]}", file=sys.stderr); sys.exit(1)
 
           def d1_query(sql, params):
               payload = json.dumps({"sql": sql, "params": params}).encode()
@@ -342,11 +411,11 @@ jobs:
                   [story_id, ch_id, model_id, kv_version, r2_key]
               )
               if body.get("success"):
-                  print(f"  ✅ 업로드 완료: {r2_key}")
+                  print(f"✅ {r2_key}")
               else:
-                  print(f"  ❌ D1 등록 실패: {body}", file=sys.stderr); sys.exit(1)
+                  print(f"❌ D1 실패: {body}", file=sys.stderr); sys.exit(1)
           except urllib.error.HTTPError as e:
-              print(f"  ❌ D1 API 실패: HTTP {e.code} | {e.read().decode()[:200]}", file=sys.stderr); sys.exit(1)
+              print(f"❌ D1 실패: HTTP {e.code} | {e.read().decode()[:200]}", file=sys.stderr); sys.exit(1)
           PYEOF
 
             if [ $? -ne 0 ]; then FAIL=$((FAIL + 1)); else SUCCESS=$((SUCCESS + 1)); fi
@@ -355,6 +424,6 @@ jobs:
 
           echo ""
           echo "════════════════════════════════════"
-          echo "[E2B] 챕터 완료: 성공 ${SUCCESS}개 / 실패 ${FAIL}개"
+          echo "[E2B] 완료: 성공 ${SUCCESS}개 / 실패 ${FAIL}개"
           echo "════════════════════════════════════"
           if [ "$FAIL" -gt 0 ]; then exit 1; fi
