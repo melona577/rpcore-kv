@@ -79,8 +79,8 @@ jobs:
 
             llama_context_params cparams = llama_context_default_params();
             cparams.n_ctx          = n_ctx;
-            cparams.n_batch        = 2048;
-            cparams.n_ubatch       = 2048;
+            cparams.n_batch        = n_ctx;
+            cparams.n_ubatch       = n_ctx;
             cparams.rope_freq_base = rope_freq_base;
             cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
 
