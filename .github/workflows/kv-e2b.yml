@@ -1,4 +1,4 @@
-name: KV Cache 생성 [E2B 전담]
+name: KV Cache 생성 [E2B]
 
 on:
   workflow_dispatch:
